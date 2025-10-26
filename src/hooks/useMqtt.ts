@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
-import { supabase } from '../lib/supabase';
-import { calculateStatus, getThresholds } from '../utils/colorStatus';
+// src/hooks/useMqtt.ts
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { calculateStatus } from '../utils/colorStatus';
 
 export interface SensorData {
   temperature: number;
@@ -11,120 +11,116 @@ export interface SensorData {
   location: { lat: number; lng: number };
 }
 
-export interface HistoricalData {
+export interface HistoricalDataPoint {
   timestamp: string;
   value: number;
 }
 
-export const useMqtt = () => {
+type Series = HistoricalDataPoint[];
+
+type UseMqttOptions = {
+  intervalMs?: number;   // default 3000ms
+  maxPoints?: number;    // default 20
+  jitter?: boolean;      // simulate brief disconnects
+};
+
+export const useMqtt = (opts: UseMqttOptions = {}) => {
+  const { intervalMs = 10000, maxPoints = 20, jitter = false } = opts;
+
   const [isConnected, setIsConnected] = useState(true);
+
   const [sensorData, setSensorData] = useState<SensorData>({
     temperature: 25,
     humidity: 60,
     soilMoisture: 45,
     light: 650,
     timestamp: new Date().toISOString(),
-    location: { lat: -8.65, lng: 115.22 }
+    location: { lat: -8.65, lng: 115.22 },
   });
 
   const [historicalData, setHistoricalData] = useState<{
-    temperature: HistoricalData[];
-    humidity: HistoricalData[];
-    soilMoisture: HistoricalData[];
-    light: HistoricalData[];
+    temperature: Series;
+    humidity: Series;
+    soilMoisture: Series;
+    light: Series;
   }>({
     temperature: [],
     humidity: [],
     soilMoisture: [],
-    light: []
+    light: [],
   });
 
-  const generateRealisticValue = useCallback((
-    currentValue: number,
-    min: number,
-    max: number,
-    volatility: number = 0.5
-  ): number => {
-    const change = (Math.random() - 0.5) * volatility;
-    const newValue = currentValue + change;
-    return Math.max(min, Math.min(max, newValue));
-  }, []);
+  // helper untuk bikin nilai realistis (bounded random walk)
+  const generateRealisticValue = useCallback(
+    (current: number, min: number, max: number, volatility = 0.5) => {
+      const change = (Math.random() - 0.5) * volatility;
+      const next = current + change;
+      return Math.max(min, Math.min(max, Number(next.toFixed(2))));
+    },
+    []
+  );
 
-  const updateSensorInDB = useCallback(async (type: string, value: number, unit: string) => {
-    try {
-      const { data: sensors } = await supabase
-        .from('sensors')
-        .select('id')
-        .eq('type', type)
-        .limit(1)
-        .maybeSingle();
-
-      if (sensors) {
-        const status = calculateStatus(type, value);
-
-        await supabase
-          .from('sensors')
-          .update({
-            status,
-            updated_at: new Date().toISOString()
-          })
-          .eq('id', sensors.id);
-
-        await supabase
-          .from('sensor_readings')
-          .insert({
-            sensor_id: sensors.id,
-            value,
-            unit,
-            timestamp: new Date().toISOString()
-          });
-      }
-    } catch (error) {
-      console.error('Error updating sensor:', error);
-    }
-  }, []);
+  // timer ref supaya clearInterval pasti jalan
+  const timerRef = useRef<number | null>(null);
 
   useEffect(() => {
-    const interval = setInterval(() => {
+    // optional: simulasi disconnect singkat
+    const maybeJitter = () => {
+      if (!jitter) return;
+      // ~5% peluang drop koneksi 1 tick
+      const drop = Math.random() < 0.05;
+      setIsConnected(!drop);
+    };
+
+    const tick = () => {
+      maybeJitter();
+
       setSensorData((prev) => {
-        const newData = {
+        const next: SensorData = {
           temperature: generateRealisticValue(prev.temperature, 18, 40, 0.3),
           humidity: generateRealisticValue(prev.humidity, 30, 90, 2),
           soilMoisture: generateRealisticValue(prev.soilMoisture, 15, 80, 1),
           light: generateRealisticValue(prev.light, 200, 1200, 30),
           timestamp: new Date().toISOString(),
-          location: prev.location
+          location: prev.location,
         };
-
-        updateSensorInDB('temperature', newData.temperature, '°C');
-        updateSensorInDB('humidity', newData.humidity, '%');
-        updateSensorInDB('soil_moisture', newData.soilMoisture, '%');
-        updateSensorInDB('light', newData.light, 'lux');
-
-        return newData;
+        return next;
       });
-    }, 3000);
+    };
 
-    return () => clearInterval(interval);
-  }, [generateRealisticValue, updateSensorInDB]);
+    // start interval
+    timerRef.current = window.setInterval(tick, intervalMs);
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [intervalMs, jitter, generateRealisticValue]);
 
+  // maintain historis (ring buffer sederhana)
   useEffect(() => {
-    setHistoricalData((prev) => {
-      const timestamp = new Date().toISOString();
-      const maxPoints = 20;
+    const timestamp = sensorData.timestamp;
+    setHistoricalData((prev) => ({
+      temperature: [...prev.temperature, { timestamp, value: sensorData.temperature }].slice(-maxPoints),
+      humidity: [...prev.humidity, { timestamp, value: sensorData.humidity }].slice(-maxPoints),
+      soilMoisture: [...prev.soilMoisture, { timestamp, value: sensorData.soilMoisture }].slice(-maxPoints),
+      light: [...prev.light, { timestamp, value: sensorData.light }].slice(-maxPoints),
+    }));
+  }, [sensorData, maxPoints]);
 
-      return {
-        temperature: [...prev.temperature, { timestamp, value: sensorData.temperature }].slice(-maxPoints),
-        humidity: [...prev.humidity, { timestamp, value: sensorData.humidity }].slice(-maxPoints),
-        soilMoisture: [...prev.soilMoisture, { timestamp, value: sensorData.soilMoisture }].slice(-maxPoints),
-        light: [...prev.light, { timestamp, value: sensorData.light }].slice(-maxPoints)
-      };
-    });
-  }, [sensorData]);
+  // status per metrik (buat badge warna/gauge state)
+  const statuses = useMemo(() => ({
+    temperature: calculateStatus('temperature', sensorData.temperature),
+    humidity: calculateStatus('humidity', sensorData.humidity),
+    soilMoisture: calculateStatus('soil_moisture', sensorData.soilMoisture),
+    light: calculateStatus('light', sensorData.light),
+  }), [sensorData]);
 
   return {
     isConnected,
     sensorData,
-    historicalData
+    historicalData,
+    statuses,        
   };
 };
